@@ -402,6 +402,7 @@ def register(ctx):
 | [`subagent_start`](#subagent_start) | A `delegate_task` child has been constructed and is about to run | ignored |
 | [`subagent_stop`](#subagent_stop) | A `delegate_task` child has exited | ignored |
 | [`pre_gateway_dispatch`](#pre_gateway_dispatch) | Gateway received a user message, before auth + dispatch | `{"action": "skip" \| "rewrite" \| "allow", ...}` to influence flow |
+| [`gateway_platform_event`](#gateway_platform_event) | An authorized adapter event has been normalized at the gateway boundary (Telegram reactions currently) | ignored |
 | [`pre_approval_request`](#pre_approval_request) | An approval decision is requested, including smart-mode auto decisions | ignored |
 | [`post_approval_response`](#post_approval_response) | An approval decision is made (or a prompt times out) | ignored |
 | [`transform_tool_result`](#transform_tool_result) | After any tool returns, before the result is handed back to the model | `str` to replace the result, `None` to leave unchanged |
@@ -1068,6 +1069,33 @@ def buffer_or_rewrite(event, **kwargs):
 def register(ctx):
     ctx.register_hook("pre_gateway_dispatch", buffer_or_rewrite)
 ```
+
+---
+
+### `gateway_platform_event`
+
+Fires for supported platform-native events only **after** the gateway's normal, profile-scoped authorization check succeeds. The callback receives plain dictionaries; raw SDK objects, adapter handles, bot clients, and callback contexts are never part of this stable contract.
+
+Telegram message reactions are the first supported event:
+
+```python
+def on_platform_event(platform, event_type, payload, **kwargs):
+    if platform == "telegram" and event_type == "reaction":
+        print(payload["chat_id"], payload["message_id"], payload["emojis"])
+
+def register(ctx):
+    ctx.register_hook("gateway_platform_event", on_platform_event)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `platform` | `str` | Stable platform id (`"telegram"`). |
+| `event_type` | `str` | Event-local contract id (`"reaction"`). |
+| `payload` | `dict` | For reactions: `emojis: list[str]`, `custom_emoji_ids: list[str]`, `chat_id: str \| None`, `message_id: str`, and `thread_id: str \| None`. |
+
+The reaction payload is additive and event-specific; there is no monolithic gateway payload version. Telegram reaction updates do not carry a topic id, so `thread_id` is currently `None` rather than guessed. Malformed events and events whose source cannot be authorized are dropped. A transient Telegram Application rebuild re-registers the observer together with the core handlers.
+
+This hook is observer-only. It does **not** add raw-event access, adapter access, cross-chat actions, or a platform-action facade. `PluginContext.dispatch_tool()` can only call tools registered in the tool registry; `send_message` is intentionally not registered there (its transport is reserved for explicit CLI, cron, kanban, and MCP delivery paths). Consequently a hook callback cannot currently call `ctx.dispatch_tool("send_message", ...)` for a media fallback. A future outbound-delivery contract must first provide stable delivered content/handles across all adapters; this slice does not pre-register an inert `gateway_message_delivered` hook.
 
 ---
 

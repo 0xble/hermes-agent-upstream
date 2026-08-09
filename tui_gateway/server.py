@@ -5439,11 +5439,19 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
             pass
         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
     if _tool_progress_enabled(sid) or _tool_lifecycle_required_for_ui(name):
-        payload = {
+        payload: dict[str, object] = {
             "tool_id": tool_call_id,
             "name": name,
             "context": _tool_ctx(name, args),
         }
+        # Desktop renders the expanded tool row (the `$` transcript) from the
+        # part's args, and `context` is an 80-char display preview — showing it
+        # where the real command belongs is the "expanded row still ends in …"
+        # bug. tool.complete already ships full args to every client; sending
+        # them here too closes the gap while the tool runs, at the cost of one
+        # duplicate transient payload per call.
+        if args:
+            payload["args"] = args
         if _session_verbose(sid):
             args_text = _tool_args_text(args)
             if args_text:
@@ -7112,9 +7120,14 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             tc_info = tool_call_args.get(tc_id) if tc_id else None
             name = (tc_info[0] if tc_info else None) or m.get("tool_name") or "tool"
             args = (tc_info[1] if tc_info else None) or {}
-            messages.append(
-                {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
-            )
+            tool_msg = {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
+            # This is the display projection — keep it faithful. `context` is
+            # an 80-char preview for collapsed row titles; renderers that show
+            # the full call (the desktop's expanded `$` transcript) rebuild it
+            # from args. Truncating here made that truncation permanent.
+            if args:
+                tool_msg["args"] = args
+            messages.append(tool_msg)
             continue
         # An assistant turn may carry only reasoning/thinking content with no
         # visible text (extended-thinking turns, thinking-only recovery

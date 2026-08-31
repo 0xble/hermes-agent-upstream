@@ -320,6 +320,11 @@ class TestBuildSkillsSystemPrompt:
             "description: Keep worktrees safe\n"
             "---\n"
         )
+        (skill_dir / "DESCRIPTION.md").write_text(
+            "---\n"
+            "description: Misleading same-name category\n"
+            "---\n"
+        )
         (tmp_path / ".skills_prompt_snapshot.json").write_text(
             json.dumps({
                 "version": 2,
@@ -342,6 +347,7 @@ class TestBuildSkillsSystemPrompt:
 
         assert "\n  general:\n    - git-worktree-discipline:" in result
         assert "\n  git-worktree-discipline:\n" not in result
+        assert "Misleading same-name category" not in result
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

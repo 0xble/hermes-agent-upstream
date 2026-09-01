@@ -5901,6 +5901,8 @@ class PluginManager:
         Unlike observer-style ``invoke_hook``, output transforms are a
         pipeline: each callback receives the current text. Callback failures
         and invalid return values are isolated so later hard guards still run.
+        ``None`` and the empty string retain the current text for compatibility;
+        callbacks cannot intentionally clear a response through this hook.
         """
         current = response_text
         transformed = False

@@ -115,6 +115,37 @@ class TestOutboundLedger:
         assert reused["record"]["status"] == "verified"
         assert reused["record"]["transport_message_id"] == "131192"
 
+    def test_terminal_result_cannot_be_overwritten(self, tmp_outbound):
+        claim_or_reuse(
+            job_id="job-1",
+            run_id="run-1",
+            message_key="automatic-action:immutable",
+            target="origin",
+            body="hello",
+            platform="telegram",
+            chat_id="2027045491",
+            thread_id=None,
+        )
+        mark_result(
+            job_id="job-1",
+            run_id="run-1",
+            message_key="automatic-action:immutable",
+            status="verified",
+            transport_message_id="131192",
+        )
+
+        record = mark_result(
+            job_id="job-1",
+            run_id="run-1",
+            message_key="automatic-action:immutable",
+            status="failed",
+            error="late failure",
+        )
+
+        assert record["status"] == "verified"
+        assert record["transport_message_id"] == "131192"
+        assert record["error"] is None
+
     def test_confirmed_failure_can_be_retried(self, tmp_outbound):
         params = {
             "job_id": "job-1",

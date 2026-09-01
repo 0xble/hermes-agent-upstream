@@ -197,7 +197,7 @@ def mark_result(
         conn.execute(
             """UPDATE outbound_messages
                SET status=?, transport_message_id=?, error=?, updated_at=?
-               WHERE job_id=? AND run_id=? AND message_key=?""",
+               WHERE job_id=? AND run_id=? AND message_key=? AND status='queued'""",
             (
                 status,
                 transport_message_id,
@@ -214,6 +214,9 @@ def mark_result(
         ).fetchone()
     if not row:
         raise LookupError("outbound message record disappeared")
+    # A send attempt has exactly one terminal result.  If a late callback or
+    # duplicate completion races this update, retain the first result rather
+    # than allowing a verified send to be downgraded to failed/ambiguous.
     return dict(row)
 
 

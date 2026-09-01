@@ -144,8 +144,13 @@ def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool
     return False
 
 
-def test_write_stdin_uses_str_for_windows_pty(monkeypatch, registry):
-    """pywinpty expects str input; bytes raises a PyString conversion error."""
+@pytest.mark.windows_only
+def test_write_stdin_uses_str_for_windows_pty(registry):
+    """pywinpty expects str input; bytes raises a PyString conversion error.
+
+    Windows-only: the str-vs-bytes choice IS the ``_IS_WINDOWS`` branch, and
+    the real pty handle it must satisfy (pywinpty) does not exist elsewhere.
+    """
     written = []
 
     class _FakePty:
@@ -155,13 +160,72 @@ def test_write_stdin_uses_str_for_windows_pty(monkeypatch, registry):
     session = _make_session(sid="pty-win")
     session._pty = _FakePty()
     registry._running[session.id] = session
-    monkeypatch.setattr("tools.process_registry._IS_WINDOWS", True)
 
     result = registry.write_stdin(session.id, "hello\n")
 
     assert result == {"status": "ok", "bytes_written": 6}
     assert written == ["hello\n"]
     assert isinstance(written[0], str)
+
+
+@pytest.mark.linux_only
+def test_write_stdin_uses_bytes_for_posix_pty(registry):
+    """The POSIX counterpart: ptyprocess expects bytes, not str."""
+    written = []
+
+    class _FakePty:
+        def write(self, value):
+            written.append(value)
+
+    session = _make_session(sid="pty-posix")
+    session._pty = _FakePty()
+    registry._running[session.id] = session
+
+    result = registry.write_stdin(session.id, "hello\n")
+
+    assert result == {"status": "ok", "bytes_written": 6}
+    assert written == [b"hello\n"]
+
+
+@pytest.mark.windows_only
+def test_submit_stdin_uses_crlf_for_windows_pty(registry):
+    """Enter on a Windows PTY is a carriage return, not a bare LF.
+
+    ConPTY cooked input only ends a line on ``\\r``; a bare ``\\n`` through
+    pywinpty is never delivered to a blocking line read (Python readline,
+    Go bufio.Scanner — the exact hang seen live with ``gh auth login``'s
+    "Press Enter to open the browser" prompt). submit_stdin must append
+    ``\\r\\n`` for Windows PTY sessions.
+    """
+    written = []
+
+    class _FakePty:
+        def write(self, value):
+            written.append(value)
+
+    session = _make_session(sid="pty-win-submit")
+    session._pty = _FakePty()
+    registry._running[session.id] = session
+
+    result = registry.submit_stdin(session.id, "Y")
+
+    assert result["status"] == "ok"
+    assert written == ["Y\r\n"]
+
+
+@pytest.mark.windows_only
+def test_submit_stdin_keeps_lf_for_windows_pipe(registry):
+    """Non-PTY (Popen pipe) sessions keep the plain LF on Windows."""
+    session = _make_session(sid="pipe-win-submit")
+    fake_stdin = MagicMock()
+    session.process = MagicMock()
+    session.process.stdin = fake_stdin
+    registry._running[session.id] = session
+
+    result = registry.submit_stdin(session.id, "Y")
+
+    assert result["status"] == "ok"
+    fake_stdin.write.assert_called_once_with("Y\n")
 
 
 # =========================================================================
@@ -863,7 +927,6 @@ class TestSpawnRewriteCompoundBackground:
         fake_thread.daemon = False
 
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
-             patch("tools.process_registry._IS_WINDOWS", False), \
              patch.dict("sys.modules", {"ptyprocess": mock_pty_module}), \
              patch("threading.Thread", return_value=fake_thread), \
              patch.object(registry, "_write_checkpoint"):
@@ -1193,8 +1256,14 @@ class TestTerminateHostPidWindows:
     target handle only, not the tree.
     """
 
+    @pytest.mark.windows_only
     def test_windows_invokes_taskkill_with_tree_and_force_flags(self, monkeypatch):
-        """The Windows branch must shell out to ``taskkill /PID N /T /F``."""
+        """The Windows branch must shell out to ``taskkill /PID N /T /F``.
+
+        Windows-only: ``taskkill.exe`` is the thing under test and only exists
+        here — with a faked ``_IS_WINDOWS`` the argv was asserted against a
+        binary that could never have run.
+        """
         from tools import process_registry as pr
 
         captured = {}
@@ -1204,7 +1273,6 @@ class TestTerminateHostPidWindows:
             captured["kwargs"] = kwargs
             return MagicMock(returncode=0, stderr="", stdout="")
 
-        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
         monkeypatch.setattr(pr.subprocess, "run", fake_run)
 
         pr.ProcessRegistry._terminate_host_pid(12345)
@@ -1242,7 +1310,6 @@ class TestTerminateHostPidPosix:
             def terminate(self):
                 terminate_order.append(self.pid)
 
-        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
         monkeypatch.setattr(psutil, "Process", _FakeParent)
         # This test covers only the SIGTERM tree-walk ordering; disable the
         # SIGKILL-escalation step (which would call psutil.wait_procs on the
@@ -1268,7 +1335,6 @@ class TestTerminateHostPidPosix:
         def fake_kill(pid, sig):
             kill_calls.append((pid, sig))
 
-        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
         monkeypatch.setattr(psutil, "Process", boom)
         monkeypatch.setattr(pr.os, "kill", fake_kill)
 
@@ -2218,3 +2284,284 @@ class TestSystemdCgroupIsolation:
         )
 
         assert pr._stop_systemd_unit("hermes-worker-gone.scope") is True
+
+
+class TestNotificationRedaction:
+    """Background-process notification delivery (completion_queue) applies the
+    same redaction as the explicit process tool — issue #43025 gap.
+
+    The _move_to_finished() and _check_watch_patterns() paths enqueue raw
+    output into the completion_queue.  After the fix, _redact_process_result()
+    is called before enqueueing so secrets are masked in the [IMPORTANT: ...]
+    messages delivered to the LLM.
+    """
+
+    def test_completion_notification_redacts_secret(self, monkeypatch):
+        """_move_to_finished completion notification redacts API keys."""
+        import agent.redact as _r
+        monkeypatch.setattr(_r, "_REDACT_ENABLED", True)
+        from tools import process_registry as pr
+
+        reg = ProcessRegistry()
+        sess = _make_session(sid="proc_notif1", command="env")
+        sess.output_buffer = "OPENAI_API_KEY=sk-proj-secret123\nHOME=/home/u"
+        sess.notify_on_complete = True
+        sess.exited = True
+        sess.exit_code = 0
+        reg._running[sess.id] = sess
+        monkeypatch.setattr(pr, "process_registry", reg)
+
+        reg._move_to_finished(sess)
+
+        # Drain and check the notification
+        results = reg.drain_notifications()
+        assert len(results) == 1
+        _evt, text = results[0]
+        assert "sk-proj-secret123" not in text
+        assert "REDACTED" in text or "sk-proj" not in text
+
+    def test_watch_match_notification_redacts_secret(self, monkeypatch):
+        """_check_watch_patterns watch_match notification redacts secrets."""
+        import agent.redact as _r
+        monkeypatch.setattr(_r, "_REDACT_ENABLED", True)
+        from tools import process_registry as pr
+
+        reg = ProcessRegistry()
+        sess = _make_session(sid="proc_notif2", command="python server.py")
+        sess.output_buffer = "Server started\nAPI_TOKEN=ghp_abc123def456\nListening on :8080"
+        sess.watch_patterns = ["API_TOKEN"]
+        sess._watch_disabled = False
+        sess._watch_hits = 0
+        sess._watch_suppressed = 0
+        sess.watcher_platform = None
+        sess.watcher_chat_id = None
+        sess.watcher_user_id = None
+        sess.watcher_user_name = None
+        sess.watcher_thread_id = None
+        sess.watcher_message_id = None
+        sess.exited = False
+        reg._running[sess.id] = sess
+        monkeypatch.setattr(pr, "process_registry", reg)
+
+        reg._check_watch_patterns(sess, "API_TOKEN=ghp_abc123def456\n")
+
+        results = reg.drain_notifications()
+        assert len(results) == 1
+        _evt, text = results[0]
+        assert "ghp_abc123def456" not in text
+        assert "ghp_" not in text or "REDACTED" in text
+
+
+# ── Prefix resolution (Factory Droid-inspired task-ID prefixes) ──────────────
+
+
+class TestGetByPrefix:
+    """ProcessRegistry.get() resolves unique ID prefixes like git short hashes."""
+
+    def test_full_id_still_exact(self, registry):
+        s = _make_session(sid="proc_4dae56ca81f6")
+        registry._running[s.id] = s
+        assert registry.get("proc_4dae56ca81f6") is s
+
+    def test_unique_prefix_resolves(self, registry):
+        s = _make_session(sid="proc_4dae56ca81f6")
+        registry._running[s.id] = s
+        assert registry.get("proc_4dae5") is s
+
+    def test_bare_suffix_resolves(self, registry):
+        s = _make_session(sid="proc_4dae56ca81f6")
+        registry._running[s.id] = s
+        assert registry.get("4dae56") is s
+
+    def test_finished_sessions_also_resolve(self, registry):
+        s = _make_session(sid="proc_9bee77aa0011", exited=True, exit_code=0)
+        registry._finished[s.id] = s
+        assert registry.get("proc_9bee") is s
+
+    def test_ambiguous_prefix_returns_none(self, registry):
+        a = _make_session(sid="proc_4dae56ca81f6")
+        b = _make_session(sid="proc_4dae99999999")
+        registry._running[a.id] = a
+        registry._running[b.id] = b
+        assert registry.get("proc_4dae") is None
+
+    def test_too_short_prefix_returns_none(self, registry):
+        s = _make_session(sid="proc_4dae56ca81f6")
+        registry._running[s.id] = s
+        assert registry.get("proc_4da") is None
+        assert registry.get("4da") is None
+        assert registry.get("proc_") is None
+        assert registry.get("") is None
+
+    def test_exact_id_wins_over_prefix_scan(self, registry):
+        # A session whose FULL id happens to be a prefix of another's must
+        # resolve to itself, never trigger the ambiguity path.
+        short = _make_session(sid="proc_4dae")
+        long = _make_session(sid="proc_4dae56ca81f6")
+        registry._running[short.id] = short
+        registry._running[long.id] = long
+        assert registry.get("proc_4dae") is short
+
+    def test_no_match_returns_none(self, registry):
+        s = _make_session(sid="proc_4dae56ca81f6")
+        registry._running[s.id] = s
+        assert registry.get("proc_ffff") is None
+
+    def test_poll_accepts_prefix(self, registry):
+        s = _make_session(sid="proc_4dae56ca81f6", output="hello world")
+        registry._running[s.id] = s
+        result = registry.poll("4dae56ca")
+        assert result["session_id"] == "proc_4dae56ca81f6"
+        assert result["status"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# Config-level model_not_found notice in delegation batch reports (#97654)
+# ---------------------------------------------------------------------------
+
+
+def _make_delegation_batch_evt(results):
+    """A batch async-delegation event carrying a per-task ``results`` list."""
+    return {
+        "type": "async_delegation",
+        "delegation_id": "deleg_97654",
+        "is_batch": True,
+        "results": results,
+        "goals": [r.get("goal") or "" for r in results],
+        "session_key": "agent:main:cli:dm:local",
+        "status": "completed",
+        "model": "upstage/solar-pro-4",
+    }
+
+
+def _patch_delegation_config(
+    monkeypatch, model="upstage/solar-pro-4", provider="openrouter", **over
+):
+    import tools.process_registry as _pr
+
+    cfg = {"model": model, "provider": provider}
+    cfg.update(over)
+    monkeypatch.setattr(_pr, "_delegation_config", lambda: cfg)
+    return cfg
+
+
+def _format_async(evt) -> str:
+    from tools.process_registry import format_process_notification
+
+    text = format_process_notification(evt)
+    assert text is not None, "format_process_notification returned None"
+    return text
+
+
+def test_model_not_found_notice_single_failure_once(monkeypatch):
+    evt = _make_delegation_batch_evt([
+        {
+            "task_index": 0,
+            "status": "failed",
+            "exit_reason": "error",
+            "goal": "Create bridge module",
+            "error": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+            "summary": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+        }
+    ])
+    _patch_delegation_config(monkeypatch)
+    text = _format_async(evt)
+    assert text is not None
+    assert text.count("SUBAGENT MODEL REJECTED") == 1
+    assert "upstage/solar-pro-4" in text
+    assert "openrouter" in text
+    assert "No fallback chain is configured" in text
+
+
+def test_model_not_found_notice_mixed_batch_named_model(monkeypatch):
+    evt = _make_delegation_batch_evt([
+        {
+            "task_index": 0,
+            "status": "failed",
+            "exit_reason": "error",
+            "goal": "A",
+            "error": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+            "summary": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+        },
+        {
+            "task_index": 1,
+            "status": "completed",
+            "goal": "B",
+            "summary": "ok",
+            "api_calls": 3,
+        },
+    ])
+    _patch_delegation_config(monkeypatch)
+    text = _format_async(evt)
+    assert text.count("SUBAGENT MODEL REJECTED") == 1
+    assert "upstage/solar-pro-4" in text
+
+
+def test_model_not_found_notice_absent_for_non_model_errors(monkeypatch):
+    evt = _make_delegation_batch_evt([
+        {
+            "task_index": 0,
+            "status": "failed",
+            "goal": "A",
+            "error": "HTTP 429: rate limit exceeded",
+        },
+        {
+            "task_index": 1,
+            "status": "failed",
+            "goal": "B",
+            "error": "Connection timed out",
+        },
+    ])
+    _patch_delegation_config(monkeypatch)
+    text = _format_async(evt)
+    assert "SUBAGENT MODEL REJECTED" not in text
+
+
+def test_model_not_found_notice_absent_when_configured_model_not_named(monkeypatch):
+    evt = _make_delegation_batch_evt([
+        {
+            "task_index": 0,
+            "status": "failed",
+            "goal": "A",
+            "error": "HTTP 400: gpt-99 is not a valid model ID",
+        }
+    ])
+    # Configured model is upstage/solar-pro-4; the rejection names gpt-99.
+    _patch_delegation_config(monkeypatch)
+    text = _format_async(evt)
+    assert "SUBAGENT MODEL REJECTED" not in text
+
+
+def test_model_not_found_notice_single_dispatch(monkeypatch):
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_single",
+        "session_key": "agent:main:cli:dm:local",
+        "goal": "task A",
+        "model": "upstage/solar-pro-4",
+        "status": "failed",
+        "error": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+        "summary": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+    }
+    _patch_delegation_config(monkeypatch)
+    text = _format_async(evt)
+    assert text.count("SUBAGENT MODEL REJECTED") == 1
+    assert "upstage/solar-pro-4" in text
+
+
+def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatch):
+    evt = _make_delegation_batch_evt([
+        {
+            "task_index": 0,
+            "status": "failed",
+            "goal": "A",
+            "error": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+        }
+    ])
+    _patch_delegation_config(
+        monkeypatch,
+        fallback_providers=[{"provider": "openrouter", "model": "upstage/solar-pro4"}],
+    )
+    text = _format_async(evt)
+    assert text.count("SUBAGENT MODEL REJECTED") == 1
+    assert "No fallback chain is configured" not in text

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -53,7 +54,13 @@ def current_run() -> CronMessagingRun | None:
 def _connect() -> sqlite3.Connection:
     run = _current_run.get()
     path = run.ledger_path if run is not None else OUTBOUND_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Create privately before SQLite creates any schema or WAL sidecars. Match
+    # the existing cron stores' owner-only permission contract.
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.close(fd)
+    from cron.jobs import _secure_file
+    _secure_file(path)
     return sqlite3.connect(path, timeout=5)
 
 

@@ -123,3 +123,20 @@ def test_ledger_atomic_claim_retry_fencing_and_reopen(tmp_path, monkeypatch):
     assert outbound.claim_or_reuse(**params)["action"] == "reuse"
     assert outbound.classify_send_result({"error": "timeout"})["status"] == "ambiguous"
     assert outbound.classify_send_result({"error": "not started", "delivery_not_attempted": True})["status"] == "failed"
+
+
+def test_ledger_is_private_before_wal_writes(tmp_path, monkeypatch):
+    import os
+    import stat
+    if os.name == "nt":
+        return
+    path = tmp_path / "cron" / "outbound.db"
+    monkeypatch.setattr(outbound, "OUTBOUND_FILE", path)
+    with outbound._transaction() as conn:
+        conn.execute("SELECT 1")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+        for suffix in ("-wal", "-shm"):
+            sidecar = path.with_name(path.name + suffix)
+            if sidecar.exists():
+                assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600

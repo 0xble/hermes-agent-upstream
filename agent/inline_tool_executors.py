@@ -107,6 +107,7 @@ def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
             ("window", "window", 5), ("sort", "sort"), ("detail", "detail", "adaptive"),
         ),
         db=session_db, current_session_id=agent.session_id,
+        platform=getattr(agent, "platform", None),
     )
 
 

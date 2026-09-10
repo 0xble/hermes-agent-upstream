@@ -76,7 +76,7 @@ class CleanupCaptureAdapter(BasePlatformAdapter):
             {"chat_id": chat_id, "content": content, "message_id": mid, "metadata": metadata}
         )
         return SendResult(
-            success=not (self.fail_final_response and content == "done-1"),
+            success=not (self.fail_final_response and "done-1" in content),
             message_id=mid,
         )
 
@@ -166,7 +166,7 @@ class QueuedProgressAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         type(self).run_count += 1
         if type(self).run_count == 2:
             adapter = type(self).replacement or type(self).adapter
@@ -193,8 +193,8 @@ class QueuedProgressAgent:
 
 
 class PendingSteerAgent(QueuedProgressAgent):
-    def run_conversation(self, message, conversation_history=None, task_id=None):
-        result = super().run_conversation(message, conversation_history, task_id)
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        result = super().run_conversation(message, conversation_history, task_id, **kwargs)
         if type(self).run_count == 1:
             result["pending_steer"] = "steered follow-up"
         return result
